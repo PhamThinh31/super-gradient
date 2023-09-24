@@ -308,6 +308,265 @@ class DetectionMetrics_075(DetectionMetrics):
         )
 
 
+# @register_metric(Metrics.DETECTION_METRICS_050_5Classes)
+# class DetectionMetrics_050_5Classes(DetectionMetrics_050):
+#     def __init__(
+#         self,
+#         num_cls: int,
+#         post_prediction_callback: DetectionPostPredictionCallback = None,
+#         normalize_targets: bool = False,
+#         recall_thres: torch.Tensor = None,
+#         score_thres: float = 0.1,
+#         top_k_predictions: int = 100,
+#         dist_sync_on_step: bool = False,
+#         accumulate_on_cpu: bool = True,
+#     ):
+
+#         # We will only consider 4 classes from now on
+#         super().__init__(
+#             4,
+#             post_prediction_callback,
+#             normalize_targets,
+#             recall_thres,
+#             score_thres,
+#             top_k_predictions,
+#             dist_sync_on_step,
+#             accumulate_on_cpu,
+#         )
+#     def _get_range_str(self):
+#         return "@0.5_5Classes"
+
+#     def update(self, preds, target: torch.Tensor, device: str, inputs: torch.tensor, crowd_targets: Optional[torch.Tensor] = None) -> None:
+#         """
+#         Apply NMS and match all the predictions and targets of a given batch, and update the metric state accordingly.
+
+#         :param preds:           Raw output of the model, the format might change from one model to another,
+#                                 but has to fit the input format of the post_prediction_callback (cx,cy,wh)
+#         :param target:          Targets for all images of shape (total_num_targets, 6) LABEL_CXCYWH. format:  (index, label, cx, cy, w, h)
+#         :param device:          Device to run on
+#         :param inputs:          Input image tensor of shape (batch_size, n_img, height, width)
+#         :param crowd_targets:   Crowd targets for all images of shape (total_num_targets, 6), LABEL_CXCYWH
+#         """
+#         self.iou_thresholds = self.iou_thresholds.to(device)
+#         _, _, height, width = inputs.shape
+
+#         targets = target.clone()
+#         # Combine labels for rest of the classes to class 4
+#         targets[targets[:, 1] > 3, 1] = 3
+
+#         crowd_targets = torch.zeros(size=(0, 6), device=device) if crowd_targets is None else crowd_targets.clone()
+#         # Combine labels for rest of the classes to class 4 for crowd_targets as well
+#         crowd_targets[crowd_targets[:, 1] > 3, 1] = 3
+
+#         preds = self.post_prediction_callback(preds, device=device)
+#         for pred in preds:
+#             pred[pred[:, 5] > 3, 1] = 3
+
+#         new_matching_info = compute_detection_matching(
+#             preds,
+#             targets,
+#             height,
+#             width,
+#             self.iou_thresholds,
+#             crowd_targets=crowd_targets,
+#             top_k=self.top_k_predictions,
+#             denormalize_targets=self.denormalize_targets,
+#             device=self.device,
+#             return_on_cpu=self.accumulate_on_cpu,
+#         )
+
+#         accumulated_matching_info = getattr(self, f"matching_info{self._get_range_str()}")
+#         setattr(self, f"matching_info{self._get_range_str()}", accumulated_matching_info + new_matching_info)
+
+@register_metric(Metrics.DETECTION_METRICS_050_5Classes)
+class DetectionMetrics_050_5Classes(DetectionMetrics_050):
+    def __init__(
+        self,
+        num_cls: int,
+        post_prediction_callback: DetectionPostPredictionCallback = None,
+        normalize_targets: bool = False,
+        recall_thres: torch.Tensor = None,
+        score_thres: float = 0.1,
+        top_k_predictions: int = 100,
+        dist_sync_on_step: bool = False,
+        accumulate_on_cpu: bool = True,
+    ):
+
+        # We will only consider 4 classes from now on
+        super().__init__(
+            5,
+            post_prediction_callback,
+            normalize_targets,
+            recall_thres,
+            score_thres,
+            top_k_predictions,
+            dist_sync_on_step,
+            accumulate_on_cpu,
+        )
+    def _get_range_str(self):
+        return "@0.5_5Classes"
+
+    def update(self, preds, target: torch.Tensor, device: str, inputs: torch.tensor, crowd_targets: Optional[torch.Tensor] = None) -> None:
+        """
+        Apply NMS and match all the predictions and targets of a given batch, and update the metric state accordingly.
+
+        :param preds:           Raw output of the model, the format might change from one model to another,
+                                but has to fit the input format of the post_prediction_callback (cx,cy,wh)
+        :param target:          Targets for all images of shape (total_num_targets, 6) LABEL_CXCYWH. format:  (index, label, cx, cy, w, h)
+        :param device:          Device to run on
+        :param inputs:          Input image tensor of shape (batch_size, n_img, height, width)
+        :param crowd_targets:   Crowd targets for all images of shape (total_num_targets, 6), LABEL_CXCYWH
+        """
+        self.iou_thresholds = self.iou_thresholds.to(device)
+        _, _, height, width = inputs.shape
+
+        targets = target.clone()
+        # Combine labels for rest of the classes to class 4
+        targets[targets[:, 1] == 3, 1] = 4
+        targets[(targets[:, 1] == 8) | (targets[:, 1] == 9), 1] = 3
+        targets[targets[:, 1] > 3, 1] = 4
+
+        crowd_targets = torch.zeros(size=(0, 6), device=device) if crowd_targets is None else crowd_targets.clone()
+        # Combine labels for rest of the classes to class 4 for crowd_targets as well
+        crowd_targets[crowd_targets[:, 1] == 3, 1] = 4
+        
+        crowd_targets[(crowd_targets[:, 1] == 8) | (crowd_targets[:, 1] == 9), 1] = 3
+        crowd_targets[crowd_targets[:, 1] > 3, 1] = 4
+
+        preds = self.post_prediction_callback(preds, device=device)
+        for pred in preds:
+            pred[pred[:, 5] == 3, 5] = 4
+            pred[(pred[:, 5] == 8) | (pred[:, 5] == 9), 5] = 3
+            pred[pred[:, 5] > 3, 5] = 4
+
+        new_matching_info = compute_detection_matching(
+            preds,
+            targets,
+            height,
+            width,
+            self.iou_thresholds,
+            crowd_targets=crowd_targets,
+            top_k=self.top_k_predictions,
+            denormalize_targets=self.denormalize_targets,
+            device=self.device,
+            return_on_cpu=self.accumulate_on_cpu,
+        )
+
+        accumulated_matching_info = getattr(self, f"matching_info{self._get_range_str()}")
+        setattr(self, f"matching_info{self._get_range_str()}", accumulated_matching_info + new_matching_info)
+
+
+
+
+@register_metric(Metrics.DETECTION_METRICS_050_3Main_Class)
+class DetectionMetrics_050_3Main_Class(DetectionMetrics_050):
+    def __init__(
+        self,
+        num_cls: int,
+        post_prediction_callback: DetectionPostPredictionCallback = None,
+        normalize_targets: bool = False,
+        recall_thres: torch.Tensor = None,
+        score_thres: float = 0.1,
+        top_k_predictions: int = 100,
+        dist_sync_on_step: bool = False,
+        accumulate_on_cpu: bool = True,
+    ):
+
+        # We will only consider 4 classes from now on
+        super().__init__(
+            3,
+            post_prediction_callback,
+            normalize_targets,
+            recall_thres,
+            score_thres,
+            top_k_predictions,
+            dist_sync_on_step,
+            accumulate_on_cpu,
+        )
+    def _get_range_str(self):
+        return "@0.5_3Main_Class"
+    
+    def update(self, preds, target: torch.Tensor, device: str, inputs: torch.tensor, crowd_targets: Optional[torch.Tensor] = None) -> None:
+        """
+        Apply NMS and match all the predictions and targets of a given batch, and update the metric state accordingly.
+
+        :param preds:           Raw output of the model, the format might change from one model to another,
+                                but has to fit the input format of the post_prediction_callback (cx,cy,wh)
+        :param target:          Targets for all images of shape (total_num_targets, 6) LABEL_CXCYWH. format:  (index, label, cx, cy, w, h)
+        :param device:          Device to run on
+        :param inputs:          Input image tensor of shape (batch_size, n_img, height, width)
+        :param crowd_targets:   Crowd targets for all images of shape (total_num_targets, 6), LABEL_CXCYWH
+        """
+        
+        self.iou_thresholds = self.iou_thresholds.to(device)
+        _, _, height, width = inputs.shape
+
+        targets = target.clone()
+        crowd_targets = torch.zeros(size=(0, 6), device=device) if crowd_targets is None else crowd_targets.clone()
+
+        # Filter out predictions and targets that are not of the first three classes
+        targets = targets[targets[:, 1] < 3]
+        
+        if crowd_targets is not None:
+            crowd_targets = crowd_targets[crowd_targets[:, 1] < 3]
+        preds = self.post_prediction_callback(preds, device=device)
+        preds = [pred[pred[:, 5] < 3] for pred in preds]
+
+        new_matching_info = compute_detection_matching(
+            preds,
+            targets,
+            height,
+            width,
+            self.iou_thresholds,
+            crowd_targets=crowd_targets,
+            top_k=self.top_k_predictions,
+            denormalize_targets=self.denormalize_targets,
+            device=self.device,
+            return_on_cpu=self.accumulate_on_cpu,
+        )
+
+        accumulated_matching_info = getattr(self, f"matching_info{self._get_range_str()}")
+        setattr(self, f"matching_info{self._get_range_str()}", accumulated_matching_info + new_matching_info)
+
+
+# @register_metric(Metrics.DETECTION_METRICS_050_4Classes)
+# class DetectionMetrics_050_4Classes(DetectionMetrics_050):
+#     def update(self, preds, target: torch.Tensor, device: str, inputs: torch.tensor, crowd_targets: Optional[torch.Tensor] = None) -> None:
+#         # Update targets to merge class 3 and onwards into a single class (class 3)
+#         targets = target.clone()
+        
+#         targets[:, 1] = torch.where(targets[:, 1] < 3, targets[:, 1], torch.tensor(3, device=device))
+#         if crowd_targets is not None:
+#             crowd_targets[:, 1] = torch.where(crowd_targets[:, 1] < 3, crowd_targets[:, 1], torch.tensor(3, device=device))
+#         # Update predictions
+#         for pred in preds:
+#             pred[:, 1] = torch.where(pred[:, 1] < 3, pred[:, 1], torch.tensor(3, device=device))
+
+#         super().update(preds, target, device, inputs, crowd_targets)
+        
+#     def _get_range_str(self):
+#         return "@0.5_4Classes"
+
+
+
+# @register_metric(Metrics.DETECTION_METRICS_050_3Main_Class)
+# class DetectionMetrics_050_3Main_Class(DetectionMetrics_050):
+#     def update(self, preds, target: torch.Tensor, device: str, inputs: torch.tensor, crowd_targets: Optional[torch.Tensor] = None) -> None:
+#         # Update targets to ignore class 3 and onwards
+#         targets = target.clone()
+#         targets = targets[targets[:, 1] < 3]
+#         if crowd_targets is not None:
+#             crowd_targets = crowd_targets[crowd_targets[:, 1] < 3]
+#         filtered_preds = []
+#         for pred in preds:
+#             mask = pred[0][:, :, 1] < 3
+#             filtered_pred = pred[0][mask]
+#             filtered_preds.append((filtered_pred, pred[1]))  # this assumes 'pred' is a tuple of two elements
+
+#         super().update(filtered_preds, target, device, inputs, crowd_targets)
+#     def _get_range_str(self):
+#         return "@0.5_3MainClass"
+
 @register_metric(Metrics.DETECTION_METRICS_050_095)
 class DetectionMetrics_050_095(DetectionMetrics):
     def __init__(

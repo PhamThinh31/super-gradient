@@ -1,5 +1,7 @@
 from torch.nn.modules.loss import _Loss, KLDivLoss
 import torch
+import torch.nn.functional as F
+
 
 from super_gradients.common.object_names import Losses
 from super_gradients.common.registry.registry import register_loss
@@ -12,7 +14,15 @@ class KDklDivLoss(KLDivLoss):
         super(KDklDivLoss, self).__init__(reduction="batchmean")
 
     def forward(self, student_output, teacher_output):
-        return super(KDklDivLoss, self).forward(torch.log_softmax(student_output, dim=1), torch.softmax(teacher_output, dim=1))
+        if isinstance(student_output, tuple):
+            student_output = student_output[0]  # Assuming the tensor is the first element of the tuple
+        if isinstance(teacher_output, tuple):
+            teacher_output = teacher_output[0]  # Assuming the tensor is the first element of the tuple
+
+        student_probs = F.log_softmax(student_output[0], dim=1)
+        teacher_probs = F.softmax(teacher_output[0], dim=1)
+
+        return super(KDklDivLoss, self).forward(student_probs, teacher_probs)
 
 
 @register_loss(Losses.KD_LOSS)

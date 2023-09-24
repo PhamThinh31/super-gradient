@@ -27,6 +27,8 @@ class Metrics:
     DETECTION_METRICS_050_095 = "DetectionMetrics_050_095"
     DETECTION_METRICS_050 = "DetectionMetrics_050"
     DETECTION_METRICS_075 = "DetectionMetrics_075"
+    DETECTION_METRICS_050_5Classes = "DetectionMetrics_050_5Classes"
+    DETECTION_METRICS_050_3Main_Class = "DetectionMetrics_050_3Main_Class"
     IOU = "IoU"
     BINARY_IOU = "BinaryIOU"
     DICE = "Dice"
