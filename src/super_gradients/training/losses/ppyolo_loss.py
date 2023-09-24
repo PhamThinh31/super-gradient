@@ -4,13 +4,16 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn, Tensor
+import math
 
 import super_gradients
 from super_gradients.common.object_names import Losses
 from super_gradients.common.registry.registry import register_loss
 from super_gradients.training.datasets.data_formats.bbox_formats.cxcywh import cxcywh_to_xyxy
 from super_gradients.training.utils.bbox_utils import batch_distance2bbox
-from super_gradients.common.environment.ddp_utils import get_world_size
+from super_gradients.training.utils.distributed_training_utils import (
+    get_world_size,
+)
 
 
 def batch_iou_similarity(box1: torch.Tensor, box2: torch.Tensor, eps: float = 1e-9) -> float:
@@ -426,7 +429,7 @@ class ATSSAssigner(nn.Module):
 
         return assigned_labels, assigned_bboxes, assigned_scores
 
-
+ 
 class TaskAlignedAssigner(nn.Module):
     """TOOD: Task-aligned One-stage Object Detection"""
 
@@ -628,7 +631,7 @@ class GIoULoss(object):
         return loss * self.loss_weight
 
 
-@register_loss(name=Losses.PPYOLOE_LOSS, deprecated_name="ppyoloe_loss")
+@register_loss(Losses.PPYOLOE_LOSS)
 class PPYoloELoss(nn.Module):
     def __init__(
         self,
@@ -863,6 +866,520 @@ class PPYoloELoss(nn.Module):
             loss_iou = torch.zeros([], device=pred_bboxes.device)
             loss_dfl = pred_dist.sum() * 0.0
         return loss_iou, loss_dfl
+
+    def _bbox_decode(self, anchor_points: Tensor, pred_dist: Tensor):
+        b, l, *_ = pred_dist.size()
+        pred_dist = torch.softmax(pred_dist.reshape([b, l, 4, self.reg_max + 1]), dim=-1)
+        pred_dist = torch.nn.functional.conv2d(pred_dist.permute(0, 3, 1, 2), self.proj_conv).squeeze(1)
+        return batch_distance2bbox(anchor_points, pred_dist)
+
+    def _bbox2distance(self, points, bbox):
+        x1y1, x2y2 = torch.split(bbox, 2, -1)
+        lt = points - x1y1
+        rb = x2y2 - points
+        return torch.cat([lt, rb], dim=-1).clip(0, self.reg_max - 0.01)
+
+    @staticmethod
+    def _focal_loss(pred_logits: Tensor, label: Tensor, alpha=0.25, gamma=2.0) -> Tensor:
+        pred_score = pred_logits.sigmoid()
+        weight = (pred_score - label).pow(gamma)
+        if alpha > 0:
+            alpha_t = alpha * label + (1 - alpha) * (1 - label)
+            weight *= alpha_t
+        loss = -weight * (label * torch.nn.functional.logsigmoid(pred_logits) + (1 - label) * torch.nn.functional.logsigmoid(-pred_logits))
+        return loss.sum()
+
+    @staticmethod
+    def _varifocal_loss(pred_logits: Tensor, gt_score: Tensor, label: Tensor, alpha=0.75, gamma=2.0) -> Tensor:
+        pred_score = pred_logits.sigmoid()
+        weight = alpha * pred_score.pow(gamma) * (1 - label) + gt_score * label
+        loss = -weight * (gt_score * torch.nn.functional.logsigmoid(pred_logits) + (1 - gt_score) * torch.nn.functional.logsigmoid(-pred_logits))
+        return loss.sum()
+
+
+
+class TaskAlignedAssigner_ReID(nn.Module):
+    """TOOD: Task-aligned One-stage Object Detection"""
+
+    def __init__(self, topk=13, alpha=1.0, beta=6.0, eps=1e-9):
+        """
+
+        :param topk: Maximum number of achors that is selected for each gt box
+        :param alpha: Power factor for class probabilities of predicted boxes (Used compute alignment metric)
+        :param beta: Power factor for IoU score of predicted boxes (Used compute alignment metric)
+        :param eps: Small constant for numerical stability
+        """
+        super(TaskAlignedAssigner_ReID, self).__init__()
+        self.topk = topk
+        self.alpha = alpha
+        self.beta = beta
+        self.eps = eps
+
+    @torch.no_grad()
+    def forward(
+        self,
+        pred_scores: Tensor,
+        pred_bboxes: Tensor,
+        # pred_reid: Tensor,
+        anchor_points: Tensor,
+        num_anchors_list: list,
+        gt_labels: Tensor,
+        gt_bboxes: Tensor,
+        gt_reid: Tensor,
+        pad_gt_mask: Tensor,
+        bg_index: int,
+        gt_scores: Optional[Tensor] = None,
+    ):
+        """
+        This code is based on https://github.com/fcjian/TOOD/blob/master/mmdet/core/bbox/assigners/task_aligned_assigner.py
+
+        The assignment is done in following steps
+        1. compute alignment metric between all bbox (bbox of all pyramid levels) and gt
+        2. select top-k bbox as candidates for each gt
+        3. limit the positive sample's center in gt (because the anchor-free detector
+           only can predict positive distance)
+        4. if an anchor box is assigned to multiple gts, the one with the
+           highest iou will be selected.
+
+        :param pred_scores: Tensor (float32): predicted class probability, shape(B, L, C)
+        :param pred_bboxes: Tensor (float32): predicted bounding boxes, shape(B, L, 4)
+        :param anchor_points: Tensor (float32): pre-defined anchors, shape(L, 2), "cxcy" format
+        :param num_anchors_list: List ( num of anchors in each level, shape(L)
+        :param gt_labels: Tensor (int64|int32): Label of gt_bboxes, shape(B, n, 1)
+        :param gt_bboxes: Tensor (float32): Ground truth bboxes, shape(B, n, 4)
+        :param pad_gt_mask: Tensor (float32): 1 means bbox, 0 means no bbox, shape(B, n, 1)
+        :param bg_index: int ( background index
+        :param gt_scores: Tensor (one, float32) Score of gt_bboxes, shape(B, n, 1)
+        :return:
+            - assigned_labels, Tensor of shape (B, L)
+            - assigned_bboxes, Tensor of shape (B, L, 4)
+            - assigned_scores, Tensor of shape (B, L, C)
+        """
+        assert pred_scores.ndim == pred_bboxes.ndim
+        assert gt_labels.ndim == gt_bboxes.ndim and gt_bboxes.ndim == 3
+
+        batch_size, num_anchors, num_classes = pred_scores.shape
+        _, num_max_boxes, _ = gt_bboxes.shape
+
+        # negative batch
+        if num_max_boxes == 0:
+            assigned_labels = torch.full([batch_size, num_anchors], bg_index, dtype=torch.long, device=gt_labels.device)
+            assigned_bboxes = torch.zeros([batch_size, num_anchors, 4], device=gt_labels.device)
+            assigned_scores = torch.zeros([batch_size, num_anchors, num_classes], device=gt_labels.device)
+            assigned_trackids = torch.full([batch_size, num_anchors], -1, dtype=torch.long, device=gt_labels.device)
+            
+            return assigned_labels, assigned_bboxes, assigned_scores, assigned_trackids
+
+        # compute iou between gt and pred bbox, [B, n, L]
+        ious = batch_iou_similarity(gt_bboxes, pred_bboxes)
+        # gather pred bboxes class score
+        pred_scores = torch.permute(pred_scores, [0, 2, 1])
+        batch_ind = torch.arange(end=batch_size, dtype=gt_labels.dtype, device=gt_labels.device).unsqueeze(-1)
+        gt_labels_ind = torch.stack([batch_ind.tile([1, num_max_boxes]), gt_labels.squeeze(-1)], dim=-1)
+
+        bbox_cls_scores = pred_scores[gt_labels_ind[..., 0], gt_labels_ind[..., 1]]
+
+        # compute alignment metrics, [B, n, L]
+        alignment_metrics = bbox_cls_scores.pow(self.alpha) * ious.pow(self.beta)
+
+        # check the positive sample's center in gt, [B, n, L]
+        is_in_gts = check_points_inside_bboxes(anchor_points, gt_bboxes)
+
+        # select topk largest alignment metrics pred bbox as candidates
+        # for each gt, [B, n, L]
+        is_in_topk = gather_topk_anchors(alignment_metrics * is_in_gts, self.topk, topk_mask=pad_gt_mask)
+
+        # select positive sample, [B, n, L]
+        mask_positive = is_in_topk * is_in_gts * pad_gt_mask
+
+        # if an anchor box is assigned to multiple gts,
+        # the one with the highest iou will be selected, [B, n, L]
+        mask_positive_sum = mask_positive.sum(dim=-2)
+        if mask_positive_sum.max() > 1:
+            mask_multiple_gts = (mask_positive_sum.unsqueeze(1) > 1).tile([1, num_max_boxes, 1])
+            is_max_iou = compute_max_iou_anchor(ious)
+            mask_positive = torch.where(mask_multiple_gts, is_max_iou, mask_positive)
+            mask_positive_sum = mask_positive.sum(dim=-2)
+        assigned_gt_index = mask_positive.argmax(dim=-2)
+
+        # assigned target
+        assigned_gt_index = assigned_gt_index + batch_ind * num_max_boxes
+        assigned_labels = torch.gather(gt_labels.flatten(), index=assigned_gt_index.flatten(), dim=0)
+        assigned_labels = assigned_labels.reshape([batch_size, num_anchors])
+        assigned_labels = torch.where(mask_positive_sum > 0, assigned_labels, torch.full_like(assigned_labels, bg_index))
+
+        
+        assigned_trackids = torch.gather(gt_reid.flatten(), index=assigned_gt_index.flatten(), dim=0)
+        assigned_trackids = assigned_trackids.reshape([batch_size, num_anchors])
+        assigned_trackids = torch.where(mask_positive_sum > 0, assigned_trackids, torch.full_like(assigned_trackids, -1))
+
+        
+        assigned_bboxes = gt_bboxes.reshape([-1, 4])[assigned_gt_index.flatten(), :]
+        assigned_bboxes = assigned_bboxes.reshape([batch_size, num_anchors, 4])
+
+        assigned_scores = torch.nn.functional.one_hot(assigned_labels, num_classes + 1)
+        ind = list(range(num_classes + 1))
+        ind.remove(bg_index)
+        assigned_scores = torch.index_select(assigned_scores, index=torch.tensor(ind, device=assigned_scores.device, dtype=torch.long), dim=-1)
+        # rescale alignment metrics
+        alignment_metrics *= mask_positive
+        max_metrics_per_instance = alignment_metrics.max(dim=-1, keepdim=True).values
+        max_ious_per_instance = (ious * mask_positive).max(dim=-1, keepdim=True).values
+        alignment_metrics = alignment_metrics / (max_metrics_per_instance + self.eps) * max_ious_per_instance
+        alignment_metrics = alignment_metrics.max(dim=-2).values.unsqueeze(-1)
+        assigned_scores = assigned_scores * alignment_metrics
+
+        return assigned_labels, assigned_bboxes, assigned_scores, assigned_trackids
+
+
+
+def sigmoid_focal_loss(
+    inputs: torch.Tensor,
+    targets: torch.Tensor,
+    alpha: float = -1,
+    gamma: float = 2,
+    reduction: str = "none",
+) -> torch.Tensor:
+    """
+    Loss used in RetinaNet for dense detection: https://arxiv.org/abs/1708.02002.
+    Args:
+        inputs: A float tensor of arbitrary shape.
+                The predictions for each example.
+        targets: A float tensor with the same shape as inputs. Stores the binary
+                 classification label for each element in inputs
+                (0 for the negative class and 1 for the positive class).
+        alpha: (optional) Weighting factor in range (0,1) to balance
+                positive vs negative examples. Default = -1 (no weighting).
+        gamma: Exponent of the modulating factor (1 - p_t) to
+               balance easy vs hard examples.
+        reduction: 'none' | 'mean' | 'sum'
+                 'none': No reduction will be applied to the output.
+                 'mean': The output will be averaged.
+                 'sum': The output will be summed.
+    Returns:
+        Loss tensor with the reduction option applied.
+    """
+    inputs = inputs.float()
+    targets = targets.float()
+    p = torch.sigmoid(inputs)
+    ce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
+    p_t = p * targets + (1 - p) * (1 - targets)
+    loss = ce_loss * ((1 - p_t) ** gamma)
+
+    if alpha >= 0:
+        alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
+        loss = alpha_t * loss
+
+    if reduction == "mean":
+        loss = loss.mean()
+    elif reduction == "sum":
+        loss = loss.sum()
+
+    return loss
+
+
+sigmoid_focal_loss_jit: "torch.jit.ScriptModule" = torch.jit.script(sigmoid_focal_loss)
+
+
+
+
+@register_loss(Losses.PPYOLOE_REID_LOSS)
+class PPYoloE_ReIDLoss(nn.Module):
+    def __init__(
+        self,
+        num_classes: int,
+        nID: int,
+        use_varifocal_loss: bool = True,
+        use_static_assigner: bool = True,
+        reg_max: int = 16,
+        classification_loss_weight: float = 1.0,
+        iou_loss_weight: float = 2.5,
+        dfl_loss_weight: float = 0.5,
+        reid_loss_weight: float = 0.5,
+        id_loss_focal: bool = False
+    ):
+        """
+        :param num_classes: Number of classes
+        :param use_varifocal_loss: Whether to use Varifocal loss for classification loss; otherwise use Focal loss
+        :param static_assigner_epoch: Whether to use static assigner or Task-Aligned assigner
+        :param classification_loss_weight: Classification loss weight
+        :param iou_loss_weight: IoU loss weight
+        :param dfl_loss_weight: DFL loss weight
+        :param reg_max: Number of regression bins (Must match the number of bins in the PPYoloE head)
+        """
+        super().__init__()
+        self.use_varifocal_loss = use_varifocal_loss
+        self.classification_loss_weight = classification_loss_weight
+        self.dfl_loss_weight = dfl_loss_weight
+        self.reid_loss_weight = reid_loss_weight
+        self.iou_loss_weight = iou_loss_weight
+        self.id_loss_focal = id_loss_focal
+
+        self.iou_loss = GIoULoss()
+        self.static_assigner = ATSSAssigner(topk=9, num_classes=num_classes)
+        self.assigner = TaskAlignedAssigner_ReID(topk=13, alpha=1.0, beta=6.0)
+        self.use_static_assigner = use_static_assigner
+        self.reg_max = reg_max
+        self.num_classes = num_classes
+        self.nID = nID
+        self.emb_scale = math.sqrt(2) * math.log(self.nID - 1)
+        self.classifier = nn.Linear(128, nID)
+        self.IDLoss = nn.CrossEntropyLoss(ignore_index=-1)
+        
+
+        # Same as in PPYoloE head
+        proj = torch.linspace(0, self.reg_max, self.reg_max + 1).reshape([1, self.reg_max + 1, 1, 1])
+        self.register_buffer("proj_conv", proj)
+
+    @torch.no_grad()
+    def _yolox_targets_to_ppyolo_reid(self, targets: torch.Tensor, batch_size: int) -> Mapping[str, torch.Tensor]:
+        """
+        Convert targets from YoloX format to PPYolo since its the easiest (not the cleanest) way to
+        have PP Yolo training & metrics computed
+
+        :param targets: (N, 6) format of bboxes is meant to be LABEL_CXCYWH (index, c, cx, cy, w, h)
+        :return: (Dictionary [str,Tensor]) with keys:
+         - gt_class: (Tensor, int64|int32): Label of gt_bboxes, shape(B, n, 1)
+         - gt_bbox: (Tensor, float32): Ground truth bboxes, shape(B, n, 4) in x1y1x2y2 format
+         - pad_gt_mask (Tensor, float32): 1 means bbox, 0 means no bbox, shape(B, n, 1)
+        """
+        image_index = targets[:, 0]
+        gt_class = targets[:, 1:2].long()
+        gt_bbox = cxcywh_to_xyxy(targets[:, 2:6], image_shape=None)
+        gt_trackid = targets[:, 6:7].long()
+
+        per_image_class = []
+        per_image_trackid = []
+        per_image_bbox = []
+        per_image_pad_mask = []
+
+        max_boxes = 0
+        for i in range(batch_size):
+            mask = image_index == i
+
+            image_labels = gt_class[mask]
+            image_bboxes = gt_bbox[mask, :]
+            image_tracks = gt_trackid[mask]
+            valid_bboxes = image_bboxes.sum(dim=1, keepdims=True) > 0
+
+            per_image_class.append(image_labels)
+            per_image_bbox.append(image_bboxes)
+            per_image_trackid.append(image_tracks)
+            per_image_pad_mask.append(valid_bboxes)
+
+            max_boxes = max(max_boxes, mask.sum().item())
+
+        for i in range(batch_size):
+            elements_to_pad = max_boxes - len(per_image_class[i])
+            padding_left = 0
+            padding_right = 0
+            padding_top = 0
+            padding_bottom = elements_to_pad
+            pad = padding_left, padding_right, padding_top, padding_bottom
+            per_image_class[i] = F.pad(per_image_class[i], pad, mode="constant", value=0)
+            per_image_trackid[i] = F.pad(per_image_trackid[i], pad, mode="constant", value=0)
+            per_image_bbox[i] = F.pad(per_image_bbox[i], pad, mode="constant", value=0)
+            per_image_pad_mask[i] = F.pad(per_image_pad_mask[i], pad, mode="constant", value=0)
+
+        return {
+            "gt_class": torch.stack(per_image_class, dim=0),
+            "gt_bbox": torch.stack(per_image_bbox, dim=0),
+            "gt_trackid": torch.stack(per_image_trackid, dim=0),
+            "pad_gt_mask": torch.stack(per_image_pad_mask, dim=0),
+        }
+
+    def forward(
+        self,
+        outputs: Union[
+            Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor], Tuple[Tuple[Tensor, Tensor], Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]]
+        ],
+        targets: Tensor,
+    ) -> Mapping[str, Tensor]:
+        """
+        :param outputs: Tuple of pred_scores, pred_distri, anchors, anchor_points, num_anchors_list, stride_tensor
+        :param targets: (Dictionary [str,Tensor]) with keys:
+         - gt_class: (Tensor, int64|int32): Label of gt_bboxes, shape(B, n, 1)
+         - gt_bbox: (Tensor, float32): Ground truth bboxes, shape(B, n, 4) in x1y1x2y2 format
+         - pad_gt_mask (Tensor, float32): 1 means bbox, 0 means no bbox, shape(B, n, 1)
+        :return:
+        """
+        # in test/eval mode the model outputs a tuple where the second item is the raw predictions
+        if isinstance(outputs, tuple) and len(outputs) == 2:
+            # in test/eval mode the Yolo model outputs a tuple where the second item is the raw predictions
+            _ , predictions = outputs
+        else:
+            predictions = outputs
+
+        (
+            pred_scores,
+            pred_distri,
+            pred_reid_feat,
+            anchors,
+            anchor_points,
+            num_anchors_list,
+            stride_tensor,
+        ) = predictions
+
+        targets = self._yolox_targets_to_ppyolo_reid(targets, batch_size=pred_scores.size(0))  # yolox -> ppyolo
+
+        anchor_points_s = anchor_points / stride_tensor
+        pred_bboxes = self._bbox_decode(anchor_points_s, pred_distri)
+
+        gt_labels = targets["gt_class"]
+        gt_bboxes = targets["gt_bbox"]
+        gt_trackid = targets["gt_trackid"]
+        pad_gt_mask = targets["pad_gt_mask"]
+        # label assignment
+        if self.use_static_assigner:
+            assigned_labels, assigned_bboxes, assigned_scores = self.static_assigner(
+                anchor_bboxes=anchors,
+                num_anchors_list=num_anchors_list,
+                gt_labels=gt_labels,
+                gt_bboxes=gt_bboxes,
+                pad_gt_mask=pad_gt_mask,
+                bg_index=self.num_classes,
+                pred_bboxes=pred_bboxes.detach() * stride_tensor,
+            )
+            alpha_l = 0.25
+        else:
+            assigned_labels, assigned_bboxes, assigned_scores, assigned_trackids = self.assigner(
+                pred_scores=pred_scores.detach().sigmoid(),  # Pred scores are logits on training for numerical stability
+                pred_bboxes=pred_bboxes.detach() * stride_tensor,
+                anchor_points=anchor_points,
+                num_anchors_list=num_anchors_list,
+                gt_labels=gt_labels,
+                gt_bboxes=gt_bboxes,
+                gt_reid=gt_trackid,
+                pad_gt_mask=pad_gt_mask,
+                bg_index=self.num_classes,
+            )
+            alpha_l = -1
+        # rescale bbox
+        assigned_bboxes /= stride_tensor
+        # cls loss
+        if self.use_varifocal_loss:
+            one_hot_label = torch.nn.functional.one_hot(assigned_labels, self.num_classes + 1)[..., :-1]
+            loss_cls = self._varifocal_loss(pred_scores, assigned_scores, one_hot_label)
+        else:
+            loss_cls = self._focal_loss(pred_scores, assigned_scores, alpha_l)
+
+        assigned_scores_sum = assigned_scores.sum()
+        if super_gradients.is_distributed():
+            torch.distributed.all_reduce(assigned_scores_sum, op=torch.distributed.ReduceOp.SUM)
+            assigned_scores_sum /= get_world_size()
+        assigned_scores_sum = torch.clip(assigned_scores_sum, min=1.0)
+        loss_cls /= assigned_scores_sum
+
+        loss_iou, loss_dfl = self._bbox_loss(
+            pred_distri,
+            pred_bboxes,
+            anchor_points_s,
+            assigned_labels,
+            assigned_bboxes,
+            assigned_scores,
+            assigned_scores_sum,
+        )
+        loss_reid = self._reid_loss(pred_reid_feat,
+                               gt_trackid,
+                               assigned_labels,
+                               assigned_trackids,
+                               self.id_loss_focal
+                               )
+
+        loss = self.classification_loss_weight * loss_cls + self.iou_loss_weight * loss_iou + self.dfl_loss_weight * loss_dfl + self.reid_loss_weight*loss_reid
+        log_losses = torch.stack([loss_cls.detach(), loss_iou.detach(), loss_dfl.detach(),loss_reid.detach(), loss.detach()])
+
+        return loss, log_losses
+
+    @property
+    def component_names(self):
+        return ["loss_cls", "loss_iou", "loss_dfl", "loss_reid" , "loss"]
+
+    def _df_loss(self, pred_dist: Tensor, target: Tensor) -> Tensor:
+        target_left = target.long()
+        target_right = target_left + 1
+        weight_left = target_right.float() - target
+        weight_right = 1 - weight_left
+
+        # [B,L,C] -> [B,C,L] to make compatible with torch.nn.functional.cross_entropy
+        # which expects channel dim to be at index 1
+        pred_dist = torch.moveaxis(pred_dist, -1, 1)
+
+        loss_left = torch.nn.functional.cross_entropy(pred_dist, target_left, reduction="none") * weight_left
+        loss_right = torch.nn.functional.cross_entropy(pred_dist, target_right, reduction="none") * weight_right
+        return (loss_left + loss_right).mean(dim=-1, keepdim=True)
+
+    def _bbox_loss(
+        self,
+        pred_dist,
+        pred_bboxes,
+        anchor_points,
+        assigned_labels,
+        assigned_bboxes,
+        assigned_scores,
+        assigned_scores_sum,
+    ):
+        # select positive samples mask
+        mask_positive = assigned_labels != self.num_classes
+        num_pos = mask_positive.sum()
+        # pos/neg loss
+        if num_pos > 0:
+            # l1 + iou
+            bbox_mask = mask_positive.unsqueeze(-1).tile([1, 1, 4])
+            pred_bboxes_pos = torch.masked_select(pred_bboxes, bbox_mask).reshape([-1, 4])
+            assigned_bboxes_pos = torch.masked_select(assigned_bboxes, bbox_mask).reshape([-1, 4])
+            bbox_weight = torch.masked_select(assigned_scores.sum(-1), mask_positive).unsqueeze(-1)
+
+            loss_iou = self.iou_loss(pred_bboxes_pos, assigned_bboxes_pos) * bbox_weight
+            loss_iou = loss_iou.sum() / assigned_scores_sum
+
+            dist_mask = mask_positive.unsqueeze(-1).tile([1, 1, (self.reg_max + 1) * 4])
+            pred_dist_pos = torch.masked_select(pred_dist, dist_mask).reshape([-1, 4, self.reg_max + 1])
+            assigned_ltrb = self._bbox2distance(anchor_points, assigned_bboxes)
+            assigned_ltrb_pos = torch.masked_select(assigned_ltrb, bbox_mask).reshape([-1, 4])
+            loss_dfl = self._df_loss(pred_dist_pos, assigned_ltrb_pos) * bbox_weight
+            loss_dfl = loss_dfl.sum() / assigned_scores_sum
+        else:
+            loss_iou = torch.zeros([], device=pred_bboxes.device)
+            loss_dfl = pred_dist.sum() * 0.0
+        return loss_iou, loss_dfl
+
+    def _reid_loss(
+        self,
+        pred_reid,
+        gt_reid,
+        assigned_labels,
+        assigned_trackids,
+        id_loss_focal
+    ):
+        # select positive samples mask
+        mask_positive = assigned_labels != self.num_classes
+        num_pos = mask_positive.sum()
+        # pos/neg loss
+        if num_pos > 0:
+            # l1 + iou
+            trackid_mask = mask_positive
+            pred_reid_pos_values = pred_reid[mask_positive]
+            # pred_reid_pos_values = self.emb_scale * F.normalize(pred_reid_pos_values)
+            
+            id_target = assigned_trackids[mask_positive]
+            
+            id_output = self.classifier(pred_reid_pos_values).contiguous()
+            
+            if id_loss_focal == True:
+                id_target_one_hot = id_output.new_zeros((pred_reid_pos_values.size(0), self.nID)).scatter_(1,
+                                                                                                  id_target.long().view(
+                                                                                                      -1, 1), 1)
+                loss_reid = sigmoid_focal_loss_jit(id_output, id_target_one_hot,
+                                                      alpha=0.25, gamma=2.0, reduction="sum"
+                                                      ) / id_output.size(0)
+            else:
+                loss_reid = self.IDLoss(id_output, id_target)
+            
+        else:
+            loss_reid = torch.zeros([], device=pred_reid.device)
+        return loss_reid
+
 
     def _bbox_decode(self, anchor_points: Tensor, pred_dist: Tensor):
         b, l, *_ = pred_dist.size()

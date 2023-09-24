@@ -19,12 +19,14 @@ from super_gradients.training.utils.predict import (
     VideoPredictions,
     Prediction,
     DetectionPrediction,
+    DetectionPrediction_ReID,
     PoseEstimationPrediction,
     ImageClassificationPrediction,
     ImagesClassificationPrediction,
     ClassificationPrediction,
 )
-from super_gradients.training.utils.utils import generate_batch, infer_model_device, resolve_torch_device
+from torch.nn.functional import softmax
+from super_gradients.training.utils.utils import generate_batch
 from super_gradients.training.utils.media.video import load_video, includes_video_extension
 from super_gradients.training.utils.media.image import ImageSource, check_image_typing
 from super_gradients.training.utils.media.stream import WebcamStreaming
@@ -68,13 +70,9 @@ class Pipeline(ABC):
         fuse_model: bool = True,
         dtype: Optional[torch.dtype] = None,
     ):
-        model_device: torch.device = infer_model_device(model=model)
-        if device:
-            device: torch.device = resolve_torch_device(device=device)
-
-        self.device: torch.device = device or model_device
+        self.device = device or next(model.parameters()).device
+        self.model = model.to(self.device)
         self.dtype = dtype or next(model.parameters()).dtype
-        self.model = model.to(device) if device and device != model_device else model
         self.class_names = class_names
 
         if isinstance(image_processor, list):
@@ -122,7 +120,6 @@ class Pipeline(ABC):
         from super_gradients.training.utils.media.image import load_images
 
         images = load_images(images)
-
         result_generator = self._generate_prediction_result(images=images, batch_size=batch_size)
         return self._combine_image_prediction_to_images(result_generator, n_images=len(images))
 
@@ -174,12 +171,8 @@ class Pipeline(ABC):
         :param images:  Iterable of numpy arrays representing images.
         :return:        Iterable of Results object, each containing the results of the prediction and the image.
         """
-        # Make sure the model is on the correct device, as it might have been moved after init
-        model_device: torch.device = infer_model_device(model=self.model)
-        if self.device != model_device:
-            self.model = self.model.to(self.device)
-
         images = list(images)  # We need to load all the images into memory, and to reuse it afterwards.
+        self.model = self.model.to(self.device)  # Make sure the model is on the correct device, as it might have been moved after init
 
         # Preprocess
         preprocessed_images, processing_metadatas = [], []
@@ -319,6 +312,47 @@ class DetectionPipeline(Pipeline):
     ) -> VideoDetectionPrediction:
         images_predictions = [image_predictions for image_predictions in tqdm(images_predictions, total=n_images, desc="Predicting Video")]
         return VideoDetectionPrediction(_images_prediction_lst=images_predictions, fps=fps)
+    
+# class DetectionPrediction_ReID(DetectionPrediction):
+#     def __init__(self, bboxes, confidence, labels, bbox_format, image_shape, reid_vector):
+#         super().__init__(bboxes, confidence, labels, bbox_format, image_shape)
+#         self.reid_vector = reid_vector  # Add the ReID vector attribute
+
+
+class DetectionPipeline_ReID(DetectionPipeline):
+    def _decode_model_output(self, model_output: Union[List, Tuple, torch.Tensor], model_input: np.ndarray) -> List[DetectionPrediction_ReID]:
+        """Decode the model output, by applying post prediction callback. This includes NMS and ReID vector extraction.
+
+        :param model_output:    Direct output of the model, without any post-processing.
+        :param model_input:     Model input (i.e. images after preprocessing).
+        :return:                Predicted Bboxes with ReID vector.
+        """
+        post_nms_predictions = self.post_prediction_callback(model_output, device=self.device)
+
+        predictions = []
+        for prediction, image in zip(post_nms_predictions, model_input):
+            # Check for None predictions and set default values
+            prediction = prediction if prediction is not None else torch.zeros((0, 7), dtype=torch.float32)  # Change 6 to 7 for ReID
+            
+            prediction = prediction.detach().cpu().numpy()
+            # Create a prediction with the ReID vector
+            predictions.append(
+                DetectionPrediction_ReID(
+                    bboxes=prediction[:, :4],
+                    confidence=prediction[:, 4],
+                    labels=prediction[:, 5],
+                    bbox_format="xyxy",
+                    image_shape=image.shape,
+                    reid_vector=prediction[:, 6:134]
+                )
+            )
+
+        return predictions
+
+    # Override other necessary methods if needed.
+    # ...
+
+# Now when you use `DetectionPipeline_ReID`, the predictions will include the ReID vector.
 
 
 class PoseEstimationPipeline(Pipeline):
@@ -418,17 +452,17 @@ class ClassificationPipeline(Pipeline):
     def _decode_model_output(self, model_output: Union[List, Tuple, torch.Tensor], model_input: np.ndarray) -> List[ClassificationPrediction]:
         """Decode the model output
 
-        :param model_output:    Direct output of the model, without any post-processing. Tensor of shape [B, C]
+        :param model_output:    Direct output of the model, without any post-processing.
         :param model_input:     Model input (i.e. images after preprocessing).
         :return:                Predicted Bboxes.
         """
-        pred_scores, pred_labels = torch.max(model_output.softmax(dim=1), 1)
+        confidence_predictions, classifier_predictions = torch.max(model_output, 1)
 
-        pred_labels = pred_labels.detach().cpu().numpy()  # [B,1]
-        pred_scores = pred_scores.detach().cpu().numpy()  # [B,1]
+        classifier_predictions = classifier_predictions.detach().cpu().numpy()
+        confidence_predictions = softmax(confidence_predictions).detach().cpu().numpy()
 
         predictions = list()
-        for prediction, confidence, image_input in zip(pred_labels, pred_scores, model_input):
+        for prediction, confidence, image_input in zip(classifier_predictions, confidence_predictions, model_input):
             predictions.append(ClassificationPrediction(confidence=float(confidence), label=int(prediction), image_shape=image_input.shape))
         return predictions
 

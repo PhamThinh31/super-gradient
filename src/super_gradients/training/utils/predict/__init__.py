@@ -1,4 +1,4 @@
-from .predictions import Prediction, DetectionPrediction, PoseEstimationPrediction, ClassificationPrediction
+from .predictions import Prediction, DetectionPrediction,DetectionPrediction_ReID, PoseEstimationPrediction, ClassificationPrediction
 from .prediction_results import (
     ImageDetectionPrediction,
     ImagesDetectionPrediction,
@@ -19,6 +19,7 @@ from .prediction_pose_estimation_results import (
 __all__ = [
     "Prediction",
     "DetectionPrediction",
+    "DetectionPrediction_ReID",
     "ClassificationPrediction",
     "ImagePrediction",
     "ImagesPredictions",

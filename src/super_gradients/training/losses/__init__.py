@@ -8,7 +8,7 @@ from super_gradients.training.losses.yolox_loss import YoloXDetectionLoss, YoloX
 from super_gradients.training.losses.ssd_loss import SSDLoss
 from super_gradients.training.losses.bce_dice_loss import BCEDiceLoss
 from super_gradients.training.losses.dice_ce_edge_loss import DiceCEEdgeLoss
-from super_gradients.training.losses.ppyolo_loss import PPYoloELoss
+from super_gradients.training.losses.ppyolo_loss import PPYoloELoss, PPYoloE_ReIDLoss
 from super_gradients.training.losses.dekr_loss import DEKRLoss
 from super_gradients.training.losses.stdc_loss import STDCLoss
 from super_gradients.training.losses.rescoring_loss import RescoringLoss
@@ -31,6 +31,7 @@ __all__ = [
     "KDLogitsLoss",
     "DiceCEEdgeLoss",
     "PPYoloELoss",
+    "PPYoloE_ReIDLoss",
     "DEKRLoss",
     "STDCLoss",
     "RescoringLoss",

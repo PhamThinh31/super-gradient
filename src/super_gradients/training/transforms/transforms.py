@@ -1101,9 +1101,112 @@ class DetectionTargetsFormatTransform(DetectionTransform):
 
     def apply_on_targets(self, targets: np.ndarray) -> np.ndarray:
         """Convert targets in input_format to output_format, filter small bboxes and pad targets"""
+        
         targets = self.targets_format_converter(targets)
         targets = self.filter_small_bboxes(targets)
         return np.ascontiguousarray(targets, dtype=np.float32)
+
+    def filter_small_bboxes(self, targets: np.ndarray) -> np.ndarray:
+        """Filter bboxes smaller than specified threshold."""
+
+        def _is_big_enough(bboxes: np.ndarray) -> np.ndarray:
+            return np.minimum(bboxes[:, 2], bboxes[:, 3]) > self.min_bbox_edge_size
+
+        targets = filter_on_bboxes(fn=_is_big_enough, tensor=targets, tensor_format=self.output_format)
+        return targets
+
+    def get_equivalent_preprocessing(self) -> List:
+        return []
+
+
+
+@register_transform(Transforms.DetectionTargetsFormatTransform_ReID)
+class DetectionTargetsFormatTransform_ReID(DetectionTransform):
+    """
+    Detection targets format transform
+
+    Convert targets in input_format to output_format, filter small bboxes and pad targets.
+
+    :param input_dim:          Shape of the images to transform.
+    :param input_format:       Format of the input targets. For instance [xmin, ymin, xmax, ymax, cls_id] refers to XYXY_LABEL.
+    :param output_format:      Format of the output targets. For instance [xmin, ymin, xmax, ymax, cls_id] refers to XYXY_LABEL
+    :param min_bbox_edge_size: bboxes with edge size lower then this values will be removed.
+    """
+
+    @resolve_param("input_format", ConcatenatedTensorFormatFactory())
+    @resolve_param("output_format", ConcatenatedTensorFormatFactory())
+    def __init__(
+        self,
+        input_dim: Union[int, Tuple[int, int], None] = None,
+        input_format: ConcatenatedTensorFormat = XYXY_LABEL,
+        output_format: ConcatenatedTensorFormat = LABEL_CXCYWH,
+        min_bbox_edge_size: float = 1,
+        max_targets: Optional[int] = None,
+    ):
+        super(DetectionTargetsFormatTransform_ReID, self).__init__()
+        _max_targets_deprication(max_targets)
+        if isinstance(input_format, DetectionTargetsFormat) or isinstance(output_format, DetectionTargetsFormat):
+            raise TypeError(
+                "DetectionTargetsFormat is not supported for input_format and output_format starting from super_gradients==3.0.7.\n"
+                "You can either:\n"
+                "\t - use builtin format among super_gradients.training.datasets.data_formats.default_formats.<FORMAT_NAME> (e.g. XYXY_LABEL, CXCY_LABEL, ..)\n"
+                "\t - define your custom format using super_gradients.training.datasets.data_formats.formats.ConcatenatedTensorFormat\n"
+            )
+        self.input_format = input_format
+        self.output_format = output_format
+        self.min_bbox_edge_size = min_bbox_edge_size
+        self.input_dim = None
+
+        if input_dim is not None:
+            input_dim = ensure_is_tuple_of_two(input_dim)
+            self._setup_input_dim_related_params(input_dim)
+
+    def _setup_input_dim_related_params(self, input_dim: tuple):
+        """Setup all the parameters that are related to input_dim."""
+        self.input_dim = input_dim
+        self.min_bbox_edge_size = self.min_bbox_edge_size / max(input_dim) if self.output_format.bboxes_format.format.normalized else self.min_bbox_edge_size
+        self.targets_format_converter = ConcatenatedTensorFormatConverter(
+            input_format=self.input_format, output_format=self.output_format, image_shape=input_dim
+        )
+
+    def __call__(self, sample: dict) -> dict:
+
+        # if self.input_dim not set yet, it will be set with first batch
+        if self.input_dim is None:
+            self._setup_input_dim_related_params(input_dim=sample["image"].shape[1:])
+
+        sample["target"] = self.apply_on_targets(sample["target"])
+        if "crowd_target" in sample.keys():
+            sample["crowd_target"] = self.apply_on_targets(sample["crowd_target"])
+        return sample
+
+    # def apply_on_targets(self, targets: np.ndarray) -> np.ndarray:
+    #     """Convert targets in input_format to output_format, filter small bboxes and pad targets"""
+    #     temp_targets = targets[..., :5]  # Keep only the first 5 elements
+    #     targets = self.targets_format_converter(temp_targets)
+    #     targets = self.filter_small_bboxes(targets)
+        
+    #     return np.ascontiguousarray(targets, dtype=np.float32)
+
+    def apply_on_targets(self, targets: np.ndarray) -> np.ndarray:
+        """Convert targets in input_format to output_format, filter small bboxes and pad targets"""
+
+        # Create a temporary targets tensor with only the first 5 elements
+        temp_targets = targets[..., :5]  # Keep only the first 5 elements
+
+        # Apply format conversion and filtering on the temporary targets tensor
+        converted_targets = self.targets_format_converter(temp_targets)
+        filtered_targets = self.filter_small_bboxes(converted_targets)
+
+        # Identify the indices of the rows that were kept after filtering
+        kept_indices = np.where(filtered_targets.sum(axis=-1) != 0)[0]
+
+        # Create a new tensor by adding the sixth column back to the filtered targets
+        final_targets = np.zeros_like(targets)
+        final_targets[kept_indices, :5] = filtered_targets
+        final_targets[..., 5:] = targets[..., 5:]  # Add back the sixth column
+
+        return np.ascontiguousarray(final_targets, dtype=np.float32)
 
     def filter_small_bboxes(self, targets: np.ndarray) -> np.ndarray:
         """Filter bboxes smaller than specified threshold."""

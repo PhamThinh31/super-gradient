@@ -28,15 +28,6 @@ class DetectionPrediction(Prediction):
         :param confidence:  Confidence scores for each bounding box
         :param labels:      Labels for each bounding box.
         :param image_shape: Shape of the image the prediction is made on, (H, W). This is used to convert bboxes to xyxy format
-
-        :param target_bboxes: np.ndarray, ground truth bounding boxes as np.ndarray of shape (image_i_object_count, 4)
-         When not None, will plot the predictions and the ground truth bounding boxes side by side (i.e 2 images stitched as one).
-
-        :param target_labels: np.ndarray, ground truth target class indices as an np.ndarray of shape (image_i_object_count).
-
-        :param target_bbox_format: str, bounding box format of target_bboxes, one of ['xyxy','xywh',
-        'yxyx' 'cxcywh' 'normalized_xyxy' 'normalized_xywh', 'normalized_yxyx', 'normalized_cxcywh']. Will raise an
-        error if not None and target_bboxes is None.
         """
         self._validate_input(bboxes, confidence, labels)
 
@@ -52,7 +43,6 @@ class DetectionPrediction(Prediction):
         self.bboxes_xyxy = bboxes_xyxy
         self.confidence = confidence
         self.labels = labels
-        self.image_shape = image_shape
 
     def _validate_input(self, bboxes: np.ndarray, confidence: np.ndarray, labels: np.ndarray) -> None:
         n_bboxes, n_confidences, n_labels = bboxes.shape[0], confidence.shape[0], labels.shape[0]
@@ -64,6 +54,26 @@ class DetectionPrediction(Prediction):
     def __len__(self):
         return len(self.bboxes_xyxy)
 
+@dataclass
+class DetectionPrediction_ReID(DetectionPrediction):
+    """Represents a detection prediction with ReID information."""
+    
+    reid_vector: np.ndarray  # Add ReID vector to the data class
+
+    def __init__(self, bboxes: np.ndarray, bbox_format: str, confidence: np.ndarray, labels: np.ndarray, reid_vector: np.ndarray, image_shape: Tuple[int, int]):
+        super().__init__(bboxes, bbox_format, confidence, labels, image_shape)
+        self._validate_reid_vector(reid_vector)
+        self.reid_vector = reid_vector
+
+    def _validate_reid_vector(self, reid_vector: np.ndarray) -> None:
+        """Ensure that the length of the ReID vector matches the number of bounding boxes."""
+        if len(self.bboxes_xyxy) != reid_vector.shape[0]:
+            raise ValueError(
+                f"The number of bounding boxes ({len(self.bboxes_xyxy)}) does not match the number of ReID vectors ({reid_vector.shape[0]})."
+            )
+
+    def __len__(self):
+        return len(self.bboxes_xyxy)
 
 @dataclass
 class PoseEstimationPrediction(Prediction):
